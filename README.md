@@ -30,7 +30,7 @@ class Post(models.Model):
 ### Map 
 
 ```YAML
-# File: mom.yml
+# File: mom.yaml
 
 mom:
   map:
@@ -42,7 +42,7 @@ mom:
 ### Object
 
 ```YAML
-# File: post.my-awesome-post.mom.yml
+# File: post.my-awesome-post.mom.yaml
 #            ^^^^^^^^^^^^^^^ is `slug` 
 
 field:
