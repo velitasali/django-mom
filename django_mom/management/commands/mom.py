@@ -48,15 +48,17 @@ class Ownership(enum.Enum):
 
 
 class MOM:
-    mapping: dict = None
-    remapping: dict = None
-    django_models: dict = None
+    mapping: dict
+    remapping: dict
+    django_models: dict
+    implicit_lookup_fields: dict
 
-    def __init__(self, mapping, remapping, django_models) -> None:
+    def __init__(self, mapping: dict, remapping: dict, django_models: dict, implicit_lookup_fields: dict) -> None:
         super().__init__()
         self.mapping = mapping
         self.remapping = remapping if remapping is not None else {}
         self.django_models = django_models
+        self.implicit_lookup_fields = implicit_lookup_fields
 
     @staticmethod
     def load_from(mom_file: str):
@@ -67,12 +69,23 @@ class MOM:
                 mapping = mom_index['map']
                 remapping = None if "remap" not in mom_index else mom_index['remap']
                 django_models = {}
+                implicit_lookup_fields = {}
 
+                unresolvable_models = []
                 for map_name, target in mapping.items():
                     if map_name in django_models:
                         raise DuplicateItemException(map_name)
 
-                    django_models[map_name] = MOM._map_django_models(target['model'], map_name)
+                    lookup_field = target['lookupField']
+                    model_import_name = target['model']
+                    django_models[map_name] = MOM._map_django_models(model_import_name, map_name)
+
+                    if model_import_name not in unresolvable_models:
+                        if model_import_name not in implicit_lookup_fields:
+                            implicit_lookup_fields[model_import_name] = lookup_field
+                        elif implicit_lookup_fields[model_import_name] != lookup_field:
+                            del implicit_lookup_fields[model_import_name]
+                            unresolvable_models.append(model_import_name)
 
                 if remapping is not None:
                     for model_import_name, target in remapping.items():
@@ -81,7 +94,7 @@ class MOM:
 
                         django_models[model_import_name] = MOM._map_django_models(model_import_name, "_REMAP")
 
-                return MOM(mapping, remapping, django_models)
+                return MOM(mapping, remapping, django_models, implicit_lookup_fields)
         except IOError:
             logging.error(f"Couldn't open '{mom_file}' file.")
             exit(1)
@@ -198,7 +211,7 @@ class Mapper:
 
     @property
     def lookup_field_name(self):
-        return self.mom.mapping[self.map_name]['field']
+        return self.mom.mapping[self.map_name]['lookupField']
 
     @property
     def model_class(self):
@@ -254,22 +267,6 @@ class Mapper:
                 if field_values is None:
                     if not updating or getattr(db_object, field_name) is not None:
                         field_diff[field_name] = None
-                elif isinstance(field_values, dict):
-                    field_values = self.streamline_fields(field_values)
-
-                    if remapper is None:
-                        remapper = Remapper.create_custom_from(related_model_class, field_values)
-
-                    child_lookup_fields = Mapper.flatten_lookup_fields(remapper.filter_lookup_fields(field_values))
-                    child_result, child_changed, child_new_value = self._start_mapping(
-                        related_model_class, child_lookup_fields, field_values, remapper.ownership,
-                        getattr(db_object, field_name) if updating else None)
-
-                    if not child_result:
-                        self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
-                        return False, False, None
-                    elif not updating or child_changed or child_new_value != getattr(db_object, field_name):
-                        field_diff[field_name] = child_new_value
                 elif isinstance(field_values, list):
                     list_of_fields = []
                     set_m2m = list(getattr(db_object, field_name).all()) if updating else None
@@ -277,11 +274,8 @@ class Mapper:
                     should_update = False
 
                     for child_field_values in field_values:
-                        child_field_values = self.streamline_fields(child_field_values)
-                        remapper_local = Remapper.create_custom_from(
-                            related_model_class, child_field_values
-                        ) if remapper is None else remapper
-
+                        remapper_local, child_field_values = Remapper.prepare(
+                            self, remapper, related_model_class, field_name, child_field_values)
                         child_lookup_fields = Mapper.flatten_lookup_fields(
                             remapper_local.filter_lookup_fields(child_field_values))
                         child_result, child_changed, child_new_value = self._start_mapping(
@@ -298,12 +292,26 @@ class Mapper:
                     if len(list_of_fields) > 0 and should_update:
                         if remapper is not None and remapper.ownership == Ownership.SINGLE and set_m2m is not None:
                             for existing_value in set_m2m:
+                                existing_value.refresh_from_db()
                                 if existing_value not in list_of_fields:
                                     self.logger.debug(f"""Deleting a removed related field from `{field_name}` """
                                                       f"""for `{lookup_fields}`""")
                                     existing_value.delete()
 
                         many2many_diff[field_name] = list_of_fields
+                else:
+                    remapper, field_values = Remapper.prepare(self, remapper, related_model_class, field_name,
+                                                              field_values)
+                    child_lookup_fields = Mapper.flatten_lookup_fields(remapper.filter_lookup_fields(field_values))
+                    child_result, child_changed, child_new_value = self._start_mapping(
+                        related_model_class, child_lookup_fields, field_values, remapper.ownership,
+                        getattr(db_object, field_name) if updating else None)
+
+                    if not child_result:
+                        self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
+                        return False, False, None
+                    elif not updating or child_changed or child_new_value != getattr(db_object, field_name):
+                        field_diff[field_name] = child_new_value
 
         if len(field_diff) > 0 or len(many2many_diff) > 0:
             self.logger.debug(f"Saving object `{lookup_fields}`")
@@ -319,7 +327,7 @@ class Mapper:
 
             db_object.save()
             self.logger.debug(f"""Object has been {"updated" if updating else "created"} `{lookup_fields}` with """
-                              f"""`{field_diff}`""")
+                              f"""`{list(field_diff.keys())}` and `{list(many2many_diff.keys())}`""")
         else:
             self.logger.debug(f"Object is up-to-date `{lookup_fields}`")
 
@@ -357,49 +365,49 @@ class Mapper:
 
 
 class Remapper:
-    from_fields: list
+    lookup_fields: list
     ownership: Ownership
     full_class_name: str
     related_model_class: object
-    from_fields_optional: list = None
+    lookup_fields_optional: list = None
 
     def __init__(
             self,
-            from_fields: list,
+            lookup_fields: list,
             ownership: Ownership,
             full_class_name: str,
             related_model_class: object,
-            from_fields_optional: list = None
+            lookup_fields_optional: list = None
     ) -> None:
         super().__init__()
-        self.from_fields = from_fields
+        self.lookup_fields = lookup_fields
         self.ownership = ownership
         self.full_class_name = full_class_name
         self.related_model_class = related_model_class
-        self.from_fields_optional = from_fields_optional
+        self.lookup_fields_optional = lookup_fields_optional
 
     @staticmethod
     def create_from(mom: MOM, related_model_class: object):
         full_class_name = Remapper.full_class_name(related_model_class)
         self_remapping: dict
-        from_fields: list
+        lookup_fields: list
         ownership = Ownership.NONE
-        from_fields_optional: list = []
+        lookup_fields_optional: list = []
         logger = logging.getLogger(full_class_name)
 
         if full_class_name in mom.remapping:
             self_remapping = mom.remapping[full_class_name]
 
             try:
-                from_fields = self_remapping['from']
+                lookup_fields = self_remapping['lookupField']
             except KeyError:
-                logger.error(f"Missing 'from' field for class <{full_class_name}>")
+                logger.error(f"Missing 'lookupField' field for class <{full_class_name}>")
                 raise MissingLookupFieldException
 
-            if 'from~' in self_remapping:
-                from_fields_optional = self_remapping['from~']
+            if 'lookupFieldOptional' in self_remapping:
+                lookup_fields_optional = self_remapping['lookupFieldOptional']
 
-            if "ownership" in self_remapping:
+            if 'ownership' in self_remapping:
                 ownership_value = self_remapping['ownership']
                 try:
                     ownership = Ownership(ownership_value)
@@ -411,24 +419,45 @@ class Remapper:
         else:
             return None
 
-        return Remapper(from_fields, ownership, full_class_name, related_model_class, from_fields_optional)
+        return Remapper(lookup_fields, ownership, full_class_name, related_model_class, lookup_fields_optional)
 
     @staticmethod
-    def create_custom_from(related_model_class, fields: dict):
-        return Remapper(list(fields.keys()), Ownership.NONE, Remapper.full_class_name(related_model_class),
-                        related_model_class)
+    def prepare(mapper: Mapper, self, related_model_class, field_name, child_fields) -> (object, dict):
+        if not isinstance(child_fields, dict):
+            if self is not None:
+                if len(self.lookup_fields) == 1:
+                    child_fields = {self.lookup_fields[0]: child_fields}
+                else:
+                    logging.error(f"""Implicit passing of field `{field_name}` that holds `{self.full_class_name}` """
+                                  f"""is not possible since it doesn't have exactly one lookup field: """
+                                  f"""{self.lookup_fields}""")
+                    exit(1)
+            else:
+                full_class_name = Remapper.full_class_name(related_model_class)
+                if full_class_name in mapper.mom.implicit_lookup_fields:
+                    child_fields = {mapper.mom.implicit_lookup_fields[full_class_name]: child_fields}
+                else:
+                    logging.error(f"""Field `{field_name}` that holds `{full_class_name}` doesn't have a mapping to """
+                                  f"""get the implicit lookup value from. Maybe you didn't intend to pass a value?""")
+                    exit(1)
+
+        child_fields = mapper.streamline_fields(child_fields)
+        if self is None:
+            self = Remapper(list(child_fields.keys()), Ownership.NONE, Remapper.full_class_name(related_model_class),
+                            related_model_class)
+        return self, child_fields
 
     def filter_lookup_fields(self, fields: dict):
         lookup_fields: dict = {}
-        for lookup_field in self.from_fields:
+        for lookup_field in self.lookup_fields:
             if lookup_field in fields:
                 lookup_fields[lookup_field] = fields[lookup_field]
             else:
-                logging.error(f"Lookup field `{lookup_field}` of `{self.full_class_name}` isn't given for `{fields}`")
+                logging.error(f"Lookup field `{lookup_field}` of `{self.full_class_name}` wasn't given for `{fields}`")
                 exit(1)
 
-        if self.from_fields_optional is not None:
-            for lookup_field in self.from_fields_optional:
+        if self.lookup_fields_optional is not None:
+            for lookup_field in self.lookup_fields_optional:
                 if lookup_field in fields and lookup_field not in lookup_fields:
                     lookup_fields[lookup_field] = fields[lookup_field]
         return lookup_fields
