@@ -1,3 +1,5 @@
+[![View the Docs](https://readthedocs.org/projects/django-mom/badge/?version=latest&style=plastic)](https://django-mom.readthedocs.org/)
+
 # Model Object Mapper for Django 
 
 Map YAML files to a database and add/update/delete them as they change.
@@ -36,7 +38,7 @@ mom:
   map:
     post:
       model: home.models.Post
-      field: slug
+      lookupField: slug
 ```
 
 ### Object
@@ -47,13 +49,13 @@ mom:
 
 field:
   title: My Awesome Title
-  date: 2021-06-25 13:00
+  date: 2021-06-25 13:00:00+3
 ```
 
 ### Result
 
 ```YAML
 title: My Awesome Title
-date: 2021-06-25 13:00
+date: 2021-06-25 13:00:00+3
 slug: my-awesome-post 
 ```

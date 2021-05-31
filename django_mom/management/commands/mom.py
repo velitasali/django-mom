@@ -1,9 +1,11 @@
 import enum
 import logging
+import os
 import re
 from os import listdir
-from os.path import isdir, isfile, join
+from os.path import getsize, getmtime, isdir, isfile, join
 from pathlib import Path
+from typing import BinaryIO
 
 import yaml
 from django.core.management.base import BaseCommand
@@ -39,6 +41,20 @@ class MissingLookupFieldException(MOMException):
 
 class UnsupportedValueException(MOMException):
     pass
+
+
+class DjangoFile:
+    file_name: str
+    file_size: int
+    file: BinaryIO
+    date_modified: float
+
+    def __init__(self, file_name: str, file_size: int, file: BinaryIO, date_modified: float) -> None:
+        super().__init__()
+        self.file_name = file_name
+        self.file_size = file_size
+        self.file = file
+        self.date_modified = date_modified
 
 
 class Ownership(enum.Enum):
@@ -250,7 +266,6 @@ class Mapper:
                 return False, False, None
 
         field_diff = {}
-        many2many_diff = {}
 
         if updating:
             self.logger.debug(f"Object exists `{lookup_fields}`")
@@ -259,15 +274,34 @@ class Mapper:
 
         for field_name, field_values in fields.items():
             related_model_class = model_class._meta.get_field(field_name).related_model
-            if related_model_class is None:
-                if not updating or field_values != getattr(db_object, field_name):
+            if related_model_class is None or field_values is None:
+                if updating and isinstance(field_values, DjangoFile):
+                    same = False
+                    file_field = getattr(db_object, field_name)
+
+                    if file_field is None:
+                        self.logger.debug(f"""The file for the field `{field_name}` wasn't defined yet: """
+                                          f"""`{lookup_fields}`""")
+                    else:
+                        try:
+                            modified = getmtime(file_field.path)
+                            if field_values.file_size == file_field.size and field_values.date_modified == modified:
+                                same = True
+                            else:
+                                self.logger.debug(f"""The file for the field `{field_name}` is different and will """
+                                                  f"""be updated for `{file_field.path}`""")
+                        except FileNotFoundError:
+                            self.logger.debug(f"""The file for the field `{field_name}` doesn't exist: """
+                                              f"""`{file_field.path}`""")
+
+                    if not same:
+                        self.logger.debug(f"The file for the field `{field_name}` will be updated.")
+                        field_diff[field_name] = field_values
+                elif not updating or field_values != getattr(db_object, field_name):
                     field_diff[field_name] = field_values
             else:
                 remapper = Remapper.create_from(self.mom, related_model_class)
-                if field_values is None:
-                    if not updating or getattr(db_object, field_name) is not None:
-                        field_diff[field_name] = None
-                elif isinstance(field_values, list):
+                if isinstance(field_values, list):
                     list_of_fields = []
                     set_m2m = list(getattr(db_object, field_name).all()) if updating else None
                     even = updating and len(set_m2m) == len(field_values)
@@ -281,12 +315,13 @@ class Mapper:
                         child_result, child_changed, child_new_value = self._start_mapping(
                             related_model_class, child_lookup_fields, child_field_values, remapper_local.ownership, )
 
-                        list_of_fields.append(child_new_value)
-
                         if not child_result:
                             self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
                             return False, False, None
-                        elif not even or child_changed or child_new_value not in set_m2m:
+
+                        list_of_fields.append(child_new_value)
+
+                        if not even or child_changed or child_new_value not in set_m2m:
                             should_update = True
 
                     if len(list_of_fields) > 0 and should_update:
@@ -298,7 +333,7 @@ class Mapper:
                                                       f"""for `{lookup_fields}`""")
                                     existing_value.delete()
 
-                        many2many_diff[field_name] = list_of_fields
+                        field_diff[field_name] = list_of_fields
                 else:
                     remapper, field_values = Remapper.prepare(self, remapper, related_model_class, field_name,
                                                               field_values)
@@ -313,25 +348,39 @@ class Mapper:
                     elif not updating or child_changed or child_new_value != getattr(db_object, field_name):
                         field_diff[field_name] = child_new_value
 
-        if len(field_diff) > 0 or len(many2many_diff) > 0:
+        if len(field_diff) > 0:
             self.logger.debug(f"Saving object `{lookup_fields}`")
 
+            primary_fields = {}
+            secondary_fields = {}
+
+            for key, value in field_diff.items():
+                if isinstance(value, list) or isinstance(value, DjangoFile):
+                    secondary_fields[key] = value
+                else:
+                    primary_fields[key] = value
+
             if updating and ownership != Ownership.SHARED:
-                for key, value in field_diff.items():
+                for key, value in primary_fields.items():
                     setattr(db_object, key, value)
             else:
-                db_object = model_class.objects.create(**field_diff)
+                db_object = model_class.objects.create(**primary_fields)
 
-            for key, value in many2many_diff.items():
-                getattr(db_object, key).set(value)
+            for key, value in secondary_fields.items():
+                if isinstance(value, DjangoFile):
+                    file_field = getattr(db_object, key)
+                    file_field.save(value.file_name, value.file)
+                    os.utime(file_field.path, (value.date_modified, value.date_modified))
+                elif isinstance(value, list):
+                    getattr(db_object, key).set(value)
 
             db_object.save()
             self.logger.debug(f"""Object has been {"updated" if updating else "created"} `{lookup_fields}` with """
-                              f"""`{list(field_diff.keys())}` and `{list(many2many_diff.keys())}`""")
+                              f"""`{list(field_diff.keys())}`""")
         else:
             self.logger.debug(f"Object is up-to-date `{lookup_fields}`")
 
-        return True, len(field_diff) > 0 or len(many2many_diff) > 0, db_object
+        return True, len(field_diff) > 0, db_object
 
     def start_mapping(self) -> bool:
         if not self.loaded:
@@ -350,10 +399,19 @@ class Mapper:
             if len(options) > 1:
                 field_name = options[0]
                 options = options[1::]
-                if "file" in options:
+                if 'file' in options:
                     file_path = join(self.pwd, field_value)
                     try:
                         field_value = Path(file_path).read_text()
+                    except Exception as exc:
+                        self.logger.error(f"Couldn't read the file '{file_path}' for {field_name}")
+                        self.logger.exception(exc)
+                        exit(1)
+                elif 'djangofile' in options:
+                    file_path = join(self.pwd, field_value)
+                    try:
+                        field_value = DjangoFile(field_value, getsize(file_path), open(file_path, 'rb'),
+                                                 getmtime(file_path))
                     except Exception as exc:
                         self.logger.error(f"Couldn't read the file '{file_path}' for {field_name}")
                         self.logger.exception(exc)
