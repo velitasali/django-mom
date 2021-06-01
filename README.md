@@ -1,4 +1,5 @@
-[![View the Docs](https://readthedocs.org/projects/django-mom/badge/?version=latest&style=plastic)](https://django-mom.readthedocs.org/)
+[![PyPI version](https://badge.fury.io/py/django-mom.svg)](https://badge.fury.io/py/django-mom)
+[![View the Docs](https://readthedocs.org/projects/django-mom/badge/?version=latest&style=flat)](https://django-mom.readthedocs.org/)
 
 # Model Object Mapper for Django 
 
