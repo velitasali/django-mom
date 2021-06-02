@@ -1,0 +1,8 @@
+mom:
+  map:
+    lang:
+      model: test_app.models.Language
+      lookupField: code
+    file:
+      model: test_app.models.File
+      lookupField: slug

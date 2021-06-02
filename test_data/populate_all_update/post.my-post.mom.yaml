@@ -1,0 +1,12 @@
+field:
+  author:
+    username: tasali
+  change: ~
+  content_data:
+    - language:
+        code: en
+      title: My Post
+      content: My post is awesome
+  tag:
+    - slug: sci-fi
+    - slug: pastiche

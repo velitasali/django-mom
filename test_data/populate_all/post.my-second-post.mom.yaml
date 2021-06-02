@@ -1,0 +1,10 @@
+field:
+  author:
+    username: auther
+  change: ~
+  content_data:
+    - language:
+        code: tr
+      title: Diğer Gönderim
+      content: Diğer gönderimin içeriği.
+  tag: ~

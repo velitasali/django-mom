@@ -1,0 +1,21 @@
+mom:
+  map:
+    author:
+      model: test_app.models.Author
+      lookupField: username
+    lang:
+      model: test_app.models.Language
+      lookupField: code
+    post:
+      model: test_app.models.Post
+      lookupField: slug
+  remap:
+    test_app.models.Tag:
+      lookupField:
+        - slug
+      ownership: shared
+    test_app.models.ContentData:
+      lookupField:
+        - language
+        - title
+      ownership: single

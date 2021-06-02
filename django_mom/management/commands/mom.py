@@ -10,7 +10,7 @@ from typing import BinaryIO
 import yaml
 from django.core.management.base import BaseCommand
 from django.db import transaction
-from django.db.models import QuerySet, Model
+from django.db.models import QuerySet, Model, ForeignKey, OneToOneField, ManyToManyField
 from django.utils.module_loading import import_string
 
 from ...settings import MOM_FOLDER, MOM_FILE
@@ -142,7 +142,7 @@ class Mapper:
         super().__init__()
         self.mom = mom
         self.map_name = map_name
-        self.fields = fields
+        self.fields = {} if fields is None else fields
         self.pwd = pwd
         self.file = file
         self.lookup_field_value = lookup_field_value
@@ -189,6 +189,11 @@ class Mapper:
 
     @staticmethod
     def load_mappers_from(mom: MOM, mom_folder: str, mom_file: str) -> list:
+        def warn_maybe_missing(missing_name: str, is_file: bool):
+            if not missing_name.startswith("_"):
+                logging.warning(f"The {'file' if is_file else 'folder'} `{missing_name}` is not included in mapping. "
+                                "If this is not a mapping file, prepend it with an underscore (_).")
+
         mappers = []
 
         for main_file in listdir(mom_folder):
@@ -199,13 +204,18 @@ class Mapper:
                 if len(matches) < 1:
                     continue
 
-                (model, map_name) = matches[0]
+                (model_name, map_name) = matches[0]
 
-                if model in mom.mapping:
-                    mappers.append(Mapper.load_from(mom, model, map_name, mom_folder, main_file))
+                if model_name in mom.mapping:
+                    mappers.append(Mapper.load_from(mom, model_name, map_name, mom_folder, main_file))
+                else:
+                    warn_maybe_missing(main_file, True)
             elif isdir(main_full_path):
-                model = main_file
-                if len(re.findall(FILE_PATTERN_PRIVATE, main_file)) != 1 or model not in mom.mapping:
+                model_name = main_file
+                not_in_mapping = model_name not in mom.mapping
+                if len(re.findall(FILE_PATTERN_PRIVATE, main_file)) != 1 or not_in_mapping:
+                    if not_in_mapping:
+                        warn_maybe_missing(main_file, False)
                     continue
 
                 for child_file in listdir(main_full_path):
@@ -214,14 +224,14 @@ class Mapper:
                     if isdir(child_full_path):
                         map_name = child_file
                         if len(re.findall(FILE_PATTERN_PRIVATE, map_name)) == 1:
-                            mappers.append(Mapper.load_from(mom, model, map_name, child_full_path, mom_file))
+                            mappers.append(Mapper.load_from(mom, model_name, map_name, child_full_path, mom_file))
                     elif isfile(child_full_path):
                         matches = re.findall(FILE_PATTERN_FOLDER, child_file)
                         if len(matches) < 1:
                             continue
 
                         (map_name) = matches[0]
-                        mappers.append(Mapper.load_from(mom, model, map_name, main_full_path, child_file))
+                        mappers.append(Mapper.load_from(mom, model_name, map_name, main_full_path, child_file))
 
         return mappers
 
@@ -273,8 +283,66 @@ class Mapper:
             self.logger.debug(f"Creation needed for object `{lookup_fields}`")
 
         for field_name, field_values in fields.items():
-            related_model_class = model_class._meta.get_field(field_name).related_model
-            if related_model_class is None or field_values is None:
+            django_field = model_class._meta.get_field(field_name)
+
+            if isinstance(django_field, ManyToManyField):
+                related_model_class = django_field.related_model
+                remapper = Remapper.create_from(self.mom, django_field.related_model)
+                list_of_fields = []
+                set_m2m = list(getattr(db_object, field_name).all()) if updating else None
+                even = updating and len(set_m2m) == len(field_values)
+                should_update = False
+
+                if field_values is None and (set_m2m is not None or not updating):
+                    field_diff[field_name] = list_of_fields
+                    continue
+
+                for child_field_values in field_values:
+                    remapper_local, child_field_values = Remapper.prepare(
+                        self, remapper, related_model_class, field_name, child_field_values)
+                    child_lookup_fields = Mapper.flatten_lookup_fields(
+                        remapper_local.filter_lookup_fields(child_field_values))
+                    child_result, child_changed, child_new_value = self._start_mapping(
+                        related_model_class, child_lookup_fields, child_field_values, remapper_local.ownership, )
+
+                    if not child_result:
+                        self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
+                        return False, False, None
+
+                    list_of_fields.append(child_new_value)
+
+                    if not even or child_changed or child_new_value not in set_m2m:
+                        should_update = True
+
+                if len(list_of_fields) > 0 and should_update:
+                    if remapper is not None and remapper.ownership == Ownership.SINGLE and set_m2m is not None:
+                        for existing_value in set_m2m:
+                            existing_value.refresh_from_db()
+                            if existing_value not in list_of_fields:
+                                self.logger.debug(f"""Deleting a removed related field from `{field_name}` """
+                                                  f"""for `{lookup_fields}`""")
+                                existing_value.delete()
+
+                    field_diff[field_name] = list_of_fields
+            elif isinstance(django_field, ForeignKey):
+                if field_values is None and (not updating or getattr(db_object, field_name) is not None):
+                    field_diff[field_name] = None
+                    continue
+
+                related_model_class = django_field.related_model
+                remapper = Remapper.create_from(self.mom, related_model_class)
+                remapper, field_values = Remapper.prepare(self, remapper, related_model_class, field_name, field_values)
+                child_lookup_fields = Mapper.flatten_lookup_fields(remapper.filter_lookup_fields(field_values))
+                child_result, child_changed, child_new_value = self._start_mapping(
+                    related_model_class, child_lookup_fields, field_values, remapper.ownership,
+                    getattr(db_object, field_name) if updating else None)
+
+                if not child_result:
+                    self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
+                    return False, False, None
+                elif not updating or child_changed or child_new_value != getattr(db_object, field_name):
+                    field_diff[field_name] = child_new_value
+            else:
                 if updating and isinstance(field_values, DjangoFile):
                     same = False
                     file_field = getattr(db_object, field_name)
@@ -299,54 +367,6 @@ class Mapper:
                         field_diff[field_name] = field_values
                 elif not updating or field_values != getattr(db_object, field_name):
                     field_diff[field_name] = field_values
-            else:
-                remapper = Remapper.create_from(self.mom, related_model_class)
-                if isinstance(field_values, list):
-                    list_of_fields = []
-                    set_m2m = list(getattr(db_object, field_name).all()) if updating else None
-                    even = updating and len(set_m2m) == len(field_values)
-                    should_update = False
-
-                    for child_field_values in field_values:
-                        remapper_local, child_field_values = Remapper.prepare(
-                            self, remapper, related_model_class, field_name, child_field_values)
-                        child_lookup_fields = Mapper.flatten_lookup_fields(
-                            remapper_local.filter_lookup_fields(child_field_values))
-                        child_result, child_changed, child_new_value = self._start_mapping(
-                            related_model_class, child_lookup_fields, child_field_values, remapper_local.ownership, )
-
-                        if not child_result:
-                            self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
-                            return False, False, None
-
-                        list_of_fields.append(child_new_value)
-
-                        if not even or child_changed or child_new_value not in set_m2m:
-                            should_update = True
-
-                    if len(list_of_fields) > 0 and should_update:
-                        if remapper is not None and remapper.ownership == Ownership.SINGLE and set_m2m is not None:
-                            for existing_value in set_m2m:
-                                existing_value.refresh_from_db()
-                                if existing_value not in list_of_fields:
-                                    self.logger.debug(f"""Deleting a removed related field from `{field_name}` """
-                                                      f"""for `{lookup_fields}`""")
-                                    existing_value.delete()
-
-                        field_diff[field_name] = list_of_fields
-                else:
-                    remapper, field_values = Remapper.prepare(self, remapper, related_model_class, field_name,
-                                                              field_values)
-                    child_lookup_fields = Mapper.flatten_lookup_fields(remapper.filter_lookup_fields(field_values))
-                    child_result, child_changed, child_new_value = self._start_mapping(
-                        related_model_class, child_lookup_fields, field_values, remapper.ownership,
-                        getattr(db_object, field_name) if updating else None)
-
-                    if not child_result:
-                        self.logger.warning(f"Skip, related field `{field_name}` not ready for `{lookup_fields}`")
-                        return False, False, None
-                    elif not updating or child_changed or child_new_value != getattr(db_object, field_name):
-                        field_diff[field_name] = child_new_value
 
         if len(field_diff) > 0:
             self.logger.debug(f"Saving object `{lookup_fields}`")
@@ -526,11 +546,11 @@ class Remapper:
 
 
 @transaction.non_atomic_requests
-def mom_run():
+def mom_run(mom_folder: str, mom_file: str):
     logger = logging.getLogger(__name__)
-    mom_file = join(MOM_FOLDER, MOM_FILE)
-    mom = MOM.load_from(mom_file)
-    mappers = Mapper.load_mappers_from(mom, MOM_FOLDER, MOM_FILE)
+    main_mom_file = join(mom_folder, mom_file)
+    mom = MOM.load_from(main_mom_file)
+    mappers = Mapper.load_mappers_from(mom, mom_folder, mom_file)
 
     while True:
         had_successful = False
@@ -561,5 +581,11 @@ def mom_run():
 
 
 class Command(BaseCommand):
+    def add_arguments(self, parser):
+        parser.add_argument('-d', '--dir', type=str, help='Override the default "%s" directory' % MOM_FOLDER,
+                            default=MOM_FOLDER)
+        parser.add_argument('-f', '--file', type=str, help='Override the default "%s" file' % MOM_FILE,
+                            default=MOM_FILE)
+
     def handle(self, *args, **options):
-        mom_run()
+        mom_run(options['dir'], options['file'])

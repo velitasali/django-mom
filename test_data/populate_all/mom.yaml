@@ -1,0 +1,28 @@
+mom:
+  map:
+    author:
+      model: test_app.models.Author
+      lookupField: username
+    change:
+      model: test_app.models.Change
+      lookupField: slug
+    lang:
+      model: test_app.models.Language
+      lookupField: code
+    post:
+      model: test_app.models.Post
+      lookupField: slug
+    tag:
+      model: test_app.models.Tag
+      lookupField: slug
+  remap:
+    test_app.models.ContentData:
+      lookupField:
+        - title
+        - content
+      ownership: single
+    test_app.models.Profile:
+      lookupField:
+        - last_name
+        - first_name
+      ownership: single
