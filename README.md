@@ -1,5 +1,6 @@
 [![PyPI version](https://badge.fury.io/py/django-mom.svg)](https://badge.fury.io/py/django-mom)
 [![View the Docs](https://readthedocs.org/projects/django-mom/badge/?version=latest&style=flat)](https://django-mom.readthedocs.org/)
+![example workflow](https://github.com/velitasali/django-mom/actions/workflows/python-test.yml/badge.svg)
 
 # Model Object Mapper for Django 
 
